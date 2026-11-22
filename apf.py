@@ -6,6 +6,7 @@ This tool scans Ableton Live projects for missing VST2 plugins and replaces them
 with available VST3 equivalents, preserving all parameter data.
 """
 
+import argparse
 import gzip
 import json
 import os
@@ -15,11 +16,53 @@ import sqlite3
 import sys
 import urllib.parse
 import xml.etree.ElementTree as ET
+from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime
 from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+
+
+def load_profiles(profiles_path: Optional[str] = None) -> List[Dict[str, Any]]:
+    """
+    Load optional per-plugin conversion profiles.
+
+    A profile tells APF how a plugin's VST3 differs from its VST2: whether its
+    ControllerState must be filled, and how its parameter slots map to real units.
+    No profiles ship with APF; they are plugin knowledge you supply. The file is
+    `conversion.profiles_path` from config.json (relative to apf.py), default
+    plugin_profiles.json. A missing file just means no profiles. Create one with
+    learn_profile.py.
+    """
+    # an absolute path wins; a relative one is resolved next to apf.py
+    path = Path(__file__).resolve().parent / (profiles_path or "plugin_profiles.json")
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            return json.load(f).get("profiles", [])
+    except FileNotFoundError:
+        return []
+    except Exception as e:
+        print(f"\nWarning: failed to load plugin_profiles.json: {e}")
+        return []
+
+
+def parse_preset_text(text: str) -> Dict[str, Dict[str, str]]:
+    """
+    Parse sectioned preset text ("#cm=Section" followed by "Key=Value" lines), a
+    state format some plugins use, into {section: {key: value}}.
+    """
+    sections: Dict[str, Dict[str, str]] = {}
+    current = None
+    for line in text.splitlines():
+        line = line.strip()
+        if line.startswith("#cm="):
+            current = line[4:]
+            sections.setdefault(current, {})
+        elif current is not None and "=" in line and line[0] not in "#/*'":
+            key, _, value = line.partition("=")
+            sections[current][key] = value
+    return sections
 
 
 class DebugLogger:
@@ -774,14 +817,24 @@ class PluginReplacer(XmlProcessor):
     Handles the actual replacement of VST2 plugins with VST3 plugins in Ableton projects.
     """
 
+    # tags Live writes on every VST3 parameter slot; Live 11 files already have them
+    # on VST2 slots too, Live 10 files do not
+    SLOT_TAGS = ("ParameterIdFlankBool", "LastUserRange", "LastInternalRange")
+    TARGET_TAGS = ("AutomationTarget", "ModulationTarget")
+
     def __init__(
         self,
         project_path: str,
         dry_run: bool = False,
         logger: Optional[DebugLogger] = None,
+        options: Optional[Dict[str, Any]] = None,
+        profiles: Optional[List[Dict[str, Any]]] = None,
     ):
         """
         Initialize the replacer with project path and dry-run mode.
+
+        options: the "conversion" section of config.json.
+        profiles: per-plugin conversion profiles (see plugin_profiles.json).
         """
         self.project_path = project_path
         self.dry_run = dry_run
@@ -789,6 +842,235 @@ class PluginReplacer(XmlProcessor):
         self.session_start = datetime.now()
         self.replaced_count = 0
         self.backup_path = ""
+        self.options = options or {}
+        self.profiles = profiles or []
+        self.last_error = ""
+
+    def _find_profile(self, *names: str) -> Optional[Dict[str, Any]]:
+        """
+        Find the conversion profile whose match terms occur in any given plugin name.
+        """
+        lowered = [n.lower() for n in names if n]
+        for profile in self.profiles:
+            terms = [t.lower() for t in profile.get("match", [])]
+            if any(t in n for t in terms for n in lowered):
+                return profile
+        return None
+
+    @staticmethod
+    def _fmt_number(value: float) -> str:
+        # round away float noise such as 51.599999999999994
+        value = round(float(value), 10)
+        return str(int(value)) if value.is_integer() else repr(value)
+
+    @staticmethod
+    def _set_value(parent: ET.Element, tag: str, value: str) -> None:
+        elem = parent.find(tag)
+        if elem is not None:
+            elem.set("Value", value)
+
+    def _set_slot_tags(self, slot: ET.Element, low, high) -> None:
+        """
+        Write ParameterIdFlankBool, LastUserRange and LastInternalRange exactly once.
+        Existing copies are removed first (Live 11 files already contain them).
+        """
+        for tag in self.SLOT_TAGS:
+            for elem in slot.findall(tag):
+                slot.remove(elem)
+
+        children = list(slot)
+        index = next((i for i, c in enumerate(children) if c.tag == "ParameterId"), None)
+        flank = ET.Element("ParameterIdFlankBool")
+        flank.set("Value", "false")
+        slot.insert(index + 1 if index is not None else len(children), flank)
+
+        for tag, first, last in (
+            ("LastUserRange", low, high),
+            ("LastInternalRange", "0", "1"),
+        ):
+            rng = ET.SubElement(slot, tag)
+            ET.SubElement(rng, "First").set("Value", str(first))
+            ET.SubElement(rng, "Last").set("Value", str(last))
+
+    def _blank_slot(self, slot: ET.Element) -> None:
+        """
+        Turn a parameter slot into an unconfigured one, the way Live stores it.
+        Automation/modulation target ids are kept.
+        """
+        self._set_value(slot, "ParameterName", "")
+        self._set_value(slot, "ParameterId", "-1")
+        self._set_value(slot, "VisualIndex", "1073741823")
+        value = slot.find("ParameterValue")
+        if value is not None:
+            for key_midi in value.findall("KeyMidi"):
+                value.remove(key_midi)
+            self._set_value(value, "LomId", "0")
+            self._set_value(value, "Manual", "0.1234567687")
+            rng = value.find("MidiControllerRange")
+            if rng is not None:
+                self._set_value(rng, "Min", "0")
+                self._set_value(rng, "Max", "1")
+        self._set_slot_tags(slot, "Invalid", "Invalid")
+
+    def _convert_slot(
+        self,
+        slot: ET.Element,
+        preset: Dict[str, Dict[str, str]],
+        profile: Dict[str, Any],
+    ) -> Tuple[str, str]:
+        """
+        Convert one VST2 parameter slot for a VST3 device.
+
+        VST2 slots hold values normalized to 0-1. Some VST3s use real units
+        instead, so a normalized value pins the knob at its minimum and the
+        parameter stops responding. If the profile says where the value lives in
+        the device's state, that is used (it is the source of truth); otherwise the
+        normalized value is rescaled linearly. The stored MIDI mapping range is
+        always rescaled linearly.
+
+        Returns (status, parameter name); status is one of
+        converted, blanked, placeholder, blank, untouched.
+        """
+        name_elem = slot.find("ParameterName")
+        id_elem = slot.find("ParameterId")
+        name = name_elem.get("Value", "") if name_elem is not None else ""
+        pid = id_elem.get("Value", "") if id_elem is not None else ""
+
+        # a profile with no parameter knowledge must not touch the slots at all
+        if not profile.get("parameters") and not profile.get("blank_unmapped", False):
+            return "untouched", name
+
+        if name == "" and pid == "-1":
+            self._set_slot_tags(slot, "Invalid", "Invalid")
+            return "blank", name
+
+        spec = profile.get("parameters", {}).get(pid)
+        if spec is not None:
+            low, high = float(spec["min"]), float(spec["max"])
+            width = high - low
+            value = slot.find("ParameterValue")
+            manual = value.find("Manual") if value is not None else None
+            rng = value.find("MidiControllerRange") if value is not None else None
+
+            old = float(manual.get("Value", "0")) if manual is not None else 0.0
+            from_preset = preset.get(spec.get("section", ""), {}).get(spec.get("key", ""))
+            new = float(from_preset) if from_preset is not None else low + old * width
+            if spec.get("stepped"):
+                new = round(new)
+            if manual is not None:
+                manual.set("Value", self._fmt_number(new))
+
+            if rng is not None:
+                for tag in ("Min", "Max"):
+                    elem = rng.find(tag)
+                    if elem is not None:
+                        elem.set(
+                            "Value",
+                            self._fmt_number(low + float(elem.get("Value", "0")) * width),
+                        )
+
+            self._set_slot_tags(slot, self._fmt_number(low), self._fmt_number(high))
+            if self.logger:
+                src = "preset" if from_preset is not None else "rescaled"
+                self.logger.log_change(
+                    "MODIFY", f"Parameter '{name}' (id {pid}): {old} -> {new} ({src})"
+                )
+            return "converted", name
+
+        if pid == "-1":
+            # named placeholder that never mapped to a real parameter
+            self._set_slot_tags(slot, 0, 1)
+            return "placeholder", name
+
+        if profile.get("blank_unmapped", False):
+            self._blank_slot(slot)
+            return "blanked", name
+
+        return "untouched", name
+
+    def _convert_parameter_list(
+        self,
+        plugin_device: ET.Element,
+        vst3_preset: ET.Element,
+        profile: Optional[Dict[str, Any]],
+        plugin_name: str,
+    ) -> None:
+        """
+        Convert the device's ParameterList for the VST3 plugin, if a profile exists.
+        """
+        plist = plugin_device.find("ParameterList")
+        if plist is None:
+            return
+
+        if profile is None or not self.options.get("convert_parameters", True):
+            named = [
+                s
+                for s in plist.findall("PluginFloatParameter")
+                if (s.find("ParameterName") is not None)
+                and s.find("ParameterName").get("Value")
+            ]
+            if named:
+                print(
+                    f"   Note: no conversion profile for '{plugin_name}'; its "
+                    f"{len(named)} configured parameter slot(s) were left as VST2 values "
+                    "and may not respond. See plugin_profiles.json."
+                )
+            return
+
+        preset: Dict[str, Dict[str, str]] = {}
+        proc = vst3_preset.find("ProcessorState")
+        if proc is not None and proc.text and profile.get("state_format") == "cm-sections":
+            try:
+                raw = bytes.fromhex("".join(proc.text.split()))
+                preset = parse_preset_text(raw.decode("latin-1"))
+            except ValueError:
+                print(f"   Warning: could not read preset data for '{plugin_name}'")
+
+        counts: Counter = Counter()
+        blanked: List[str] = []
+        for slot in plist.findall("PluginFloatParameter"):
+            status, name = self._convert_slot(slot, preset, profile)
+            counts[status] += 1
+            if status == "blanked":
+                blanked.append(name)
+
+        if counts["converted"] or counts["blanked"]:
+            print(
+                f"   Parameters: {counts['converted']} converted, "
+                f"{counts['blanked']} blanked"
+            )
+            for name in blanked:
+                print(f"     blanked (no VST3 parameter known): {name}")
+        if profile.get("verified") is False:
+            print(
+                f"   Warning: the '{profile.get('name', plugin_name)}' profile is "
+                "untested; check the converted plugin by ear."
+            )
+
+    def _target_ids(self, root: ET.Element) -> List[Tuple[str, str]]:
+        return sorted(
+            (tag, elem.get("Id", ""))
+            for tag in self.TARGET_TAGS
+            for elem in root.iter(tag)
+        )
+
+    def _validate_conversion(
+        self, root: ET.Element, targets_before: List[Tuple[str, str]]
+    ) -> None:
+        """
+        Refuse to save a project Live would reject or silently rewire:
+        no parameter slot may repeat a child tag, and automation/modulation
+        target ids must be exactly what they were before the conversion.
+        """
+        for slot in root.iter("PluginFloatParameter"):
+            tags = [c.tag for c in slot]
+            repeated = sorted({t for t in tags if tags.count(t) > 1})
+            if repeated:
+                raise ValueError(
+                    f"validation failed: a parameter slot repeats {', '.join(repeated)}"
+                )
+        if self._target_ids(root) != targets_before:
+            raise ValueError("validation failed: automation target ids changed")
 
     def _create_element_with_value(
         self, parent: ET.Element, name: str, value: str = None
@@ -896,11 +1178,29 @@ class PluginReplacer(XmlProcessor):
         if self.dry_run:
             print("   Dry-run enabled: skipping file modification.")
 
+        self.last_error = ""
+
+        # some entries in Live's plugin database carry an unusable VST3 id
+        # (e.g. "...14?n=Name"); skip those with a clear message instead of crashing
+        if project_plugin.plugin_type == "vst2" and replacement.plugin_type == "vst3":
+            try:
+                self._uuid_to_uid_fields(self._get_vst3_device_id(replacement))
+            except ValueError:
+                self.last_error = (
+                    f"Live's plugin database has an unusable VST3 id for "
+                    f"'{replacement.name}' ({replacement.unique_id})"
+                )
+                print(f"\n  Skipped: {self.last_error}")
+                if self.logger:
+                    self.logger.log_error(self.last_error)
+                return False
+
         try:
             # parse project file (handle both gzipped .als and plain XML)
             root, is_gzipped, original_content = self._parse_project_xml(
                 self.project_path
             )
+            targets_before = self._target_ids(root)
 
             # find the specific plugin element in the project XML
             plugin_element = self._find_plugin_element(root, project_plugin)
@@ -925,6 +1225,9 @@ class PluginReplacer(XmlProcessor):
                 # simple path update for same-format replacements
                 self._update_plugin_path(plugin_element, replacement)
 
+            # never save something Live would reject
+            self._validate_conversion(root, targets_before)
+
             # save the modified project back to disk
             if not self.dry_run:
                 self._save_project(root, is_gzipped, original_content)
@@ -942,6 +1245,7 @@ class PluginReplacer(XmlProcessor):
             return True
 
         except Exception as e:
+            self.last_error = str(e)
             print(f"\n  Error replacing plugin: {e}")
             if self.logger:
                 self.logger.log_error(f"\n  Error during replace: {e}")
@@ -1092,9 +1396,35 @@ class PluginReplacer(XmlProcessor):
             print(f"   Warning: No Buffer data found for {replacement.name}")
 
         # add remaining elements (ControllerState, Name, PresetRef)
+        vst2_name_elem = element.find(".//PlugName")
+        vst2_name = (
+            vst2_name_elem.get("Value", "") if vst2_name_elem is not None else ""
+        )
+        profile = self._find_profile(vst2_name, replacement.name)
+
+        # Live's own VST3 saves for some plugins store the preset in both
+        # ProcessorState and ControllerState; an empty ControllerState makes the
+        # plugin start from defaults. The "fill_controller_state" option is
+        # "profile" (default: only for plugins whose profile asks for it), true or false.
+        fill_mode = self.options.get("fill_controller_state", "profile")
+        fill_controller = fill_mode is True or (
+            fill_mode == "profile"
+            and profile is not None
+            and profile.get("fill_controller_state", False)
+        )
+
         for elem_name in ["ControllerState", "Name", "PresetRef"]:
             value = "" if elem_name == "Name" else None
-            self._create_element_with_value(vst3_preset, elem_name, value)
+            new_elem = self._create_element_with_value(vst3_preset, elem_name, value)
+            if elem_name == "ControllerState" and fill_controller:
+                proc = vst3_preset.find("ProcessorState")
+                if proc is not None and proc.text:
+                    new_elem.text = proc.text
+                    if self.logger:
+                        self.logger.log_change(
+                            "MODIFY",
+                            "Filled ControllerState from ProcessorState",
+                        )
 
         # add plugin name element (outside preset)
         self._create_element_with_value(vst3_info, "Name", replacement.name)
@@ -1130,6 +1460,9 @@ class PluginReplacer(XmlProcessor):
             if plugin_device is not None:
                 self._update_pointee_reference(plugin_device, replacement)
                 self._update_branch_context(plugin_device, replacement)
+                self._convert_parameter_list(
+                    plugin_device, vst3_preset, profile, replacement.name
+                )
 
     def _update_plugin_path(self, element: ET.Element, replacement: PluginInfo):
         """
@@ -1370,6 +1703,11 @@ def load_config() -> Dict[str, Any]:
             "create_backup": True,
             "backup_suffix": ".bkp",
         },
+        "conversion": {
+            "fill_controller_state": "profile",
+            "convert_parameters": True,
+            "profiles_path": "plugin_profiles.json",
+        },
         "output": {
             "debug_level": 1,
             "log_file": "apf.log",
@@ -1430,10 +1768,35 @@ def main():
     log_file = output_config.get("log_file", "apf.log")
     debug_level = output_config.get("debug_level", 1)
 
+    # command line: project path (spaces allowed) plus non-interactive options
+    parser = argparse.ArgumentParser(
+        description="Replace missing VST2 plugins in an Ableton Live project with VST3."
+    )
+    parser.add_argument("project", nargs="*", help="path to the .als project")
+    parser.add_argument(
+        "--choose",
+        choices=["ask", "first"],
+        default="ask",
+        help="'first' takes the first replacement for every plugin without asking",
+    )
+    parser.add_argument(
+        "--skip",
+        action="append",
+        default=[],
+        metavar="PLUGIN",
+        help="skip every instance of this plugin name (repeatable)",
+    )
+    parser.add_argument(
+        "--no-pause", action="store_true", help="do not wait for Enter at the end"
+    )
+    args = parser.parse_args()
+    skip_names = {s.lower() for s in args.skip}
+    results: List[Tuple[str, str]] = []  # (plugin name, status)
+
     # get project file path from command line or input
-    if len(sys.argv) > 1:
+    if args.project:
         # handle paths with spaces
-        project_file = " ".join(sys.argv[1:])
+        project_file = " ".join(args.project)
     else:
         project_file = input("Enter path to Live project file: ").strip()
         if not project_file:
@@ -1508,7 +1871,13 @@ def main():
         print("=" * 50)
 
         # create the replacer
-        replacer = PluginReplacer(project_file, dry_run=dry_run_flag, logger=logger)
+        replacer = PluginReplacer(
+            project_file,
+            dry_run=dry_run_flag,
+            logger=logger,
+            options=config.get("conversion", {}),
+            profiles=load_profiles(config.get("conversion", {}).get("profiles_path")),
+        )
         replacer.backup_path = f"{project_file}{backup_suffix}"
 
         # create the backup
@@ -1533,17 +1902,29 @@ def main():
                 for j, replacement in enumerate(potential_replacements):
                     print(f"   {j+1}. {replacement.name} ({replacement.plugin_type})")
 
+                # non-interactive answers (--skip / --choose first)
+                auto_choice = None
+                if project_plugin.name.lower() in skip_names:
+                    auto_choice = "s"
+                elif args.choose == "first":
+                    auto_choice = "1"
+
                 while True:
                     try:
-                        choice = (
-                            input(
-                                f"\n   Choose (1-{len(potential_replacements)}) or 's' to skip: "
+                        if auto_choice is not None:
+                            choice = auto_choice
+                            print(f"\n   Choice (non-interactive): {choice}")
+                        else:
+                            choice = (
+                                input(
+                                    f"\n   Choose (1-{len(potential_replacements)}) or 's' to skip: "
+                                )
+                                .strip()
+                                .lower()
                             )
-                            .strip()
-                            .lower()
-                        )
                         if choice == "s":
                             print(f"   Skipped {project_plugin.name}")
+                            results.append((project_plugin.name, "skipped"))
 
                             if replacer.logger:
                                 replacer.logger.log("")
@@ -1562,8 +1943,15 @@ def main():
                                     project_plugin, selected_replacement
                                 ):
                                     print(f"\n   Successfully replaced!")
+                                    results.append((project_plugin.name, "replaced"))
                                 else:
                                     print(f"\n   Replacement failed!")
+                                    results.append(
+                                        (
+                                            project_plugin.name,
+                                            f"failed: {replacer.last_error}",
+                                        )
+                                    )
                                 break
                             else:
                                 print(
@@ -1576,6 +1964,7 @@ def main():
                         break
             else:
                 print(f"No automatic matches found; skipped {project_plugin.name}")
+                results.append((project_plugin.name, "no match"))
 
                 if replacer.logger:
                     replacer.logger.log("")
@@ -1613,6 +2002,28 @@ def main():
 
     print(f"   Replaced plugins: {replaced_count}")
 
+    # per-plugin outcome table; plugins with no candidate never reach the replace loop
+    matched_ids = {id(p) for p, _ in matches}
+    for p in project_plugins:
+        if p.is_missing and p.plugin_type == "vst2" and id(p) not in matched_ids:
+            results.append((p.name, "no match"))
+
+    if results:
+        print("\n   Outcome by plugin:")
+        by_plugin: Dict[str, Counter] = {}
+        failures: Dict[str, str] = {}
+        for name, status in results:
+            kind = status.split(":")[0]
+            by_plugin.setdefault(name, Counter())[kind] += 1
+            if kind == "failed":
+                failures[name] = status[len("failed:"):].strip()
+        width = max(len(n) for n in by_plugin)
+        for name, counter in sorted(by_plugin.items()):
+            parts = ", ".join(f"{n} {k}" for k, n in counter.items())
+            print(f"     {name.ljust(width)}  {parts}")
+            if name in failures and failures[name]:
+                print(f"     {' ' * width}  reason: {failures[name]}")
+
     # stop logging
     if "replacer" in locals():
         replacer.stop_logging()
@@ -1620,4 +2031,6 @@ def main():
 
 if __name__ == "__main__":
     main()
-    input("Please enter something: ")
+    # keep the window open for double-click use; never block piped/automated runs
+    if sys.stdin.isatty() and "--no-pause" not in sys.argv:
+        input("Please enter something: ")

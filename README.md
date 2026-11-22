@@ -68,6 +68,59 @@ The tool uses a `config.json` to control some of its behavior.
 | `debug_level`            | Log verbosity: 1 (minimal) to 3 (everything)              | 1       |
 | `log_file`               | Where to save the logs.                                   | apf.log |
 
+## Unattended runs
+```bash
+python apf.py project.als --choose first --skip SomePlugin --no-pause
+```
+- `--choose first` takes the first replacement for every plugin (default is to ask).
+- `--skip NAME` skips every instance of that plugin (repeatable).
+- `--no-pause` skips the final "press Enter" (it is also skipped automatically when input is piped).
+
+At the end APF prints an outcome table per plugin (replaced / skipped / failed with the reason / no match).
+Nothing is saved if the converted project fails its checks (a parameter slot with a repeated tag, or any
+automation/modulation target id that changed).
+
+## VST3 state and parameter conversion
+Swapping the plugin wrapper is not enough for every plugin. Some VST3s store their state or parameters
+differently from the VST2. The project then loads with the right preset name but the wrong sound, and
+configured parameters do not respond. Fixing that needs knowledge about the specific plugin, so APF does not
+ship any: you supply optional **profiles** (`plugin_profiles.json`, see `plugin_profiles.example.json`) and a
+helper, `learn_profile.py`, creates them from a Live set. Plugins without a profile are converted as before,
+with a note that their parameter slots were left unchanged.
+
+What a profile can ask APF to do:
+
+- **`fill_controller_state`**: some VST3s are saved by Live with the preset in both `ProcessorState` and
+  `ControllerState`. APF only wrote `ProcessorState`, which leaves such a plugin starting from defaults.
+- **Parameter units**: VST2 parameter slots hold values normalized to 0-1, but some VST3s use real units
+  (for example a frequency knob of 30-150). A normalized value then pins the knob at its minimum and it stops
+  responding. APF rewrites each configured parameter's value (read from the device's own state text when the
+  profile says where it lives, otherwise rescaled linearly), rescales the stored MIDI mapping range, and writes
+  the tags Live expects (`ParameterIdFlankBool`, `LastUserRange`, `LastInternalRange`) exactly once.
+  Live 11 files already contain those tags and Live 10 files do not; both work.
+- **`blank_unmapped`**: configured slots whose parameter is not in the profile become blank slots instead of
+  staying clamped. APF lists them so you know what to re-add by hand.
+
+Config (`config.json`):
+
+| Config                                | Description                                                              | Default                |
+|---------------------------------------|--------------------------------------------------------------------------|------------------------|
+| `conversion.fill_controller_state`    | `"profile"` (only plugins whose profile asks for it), `true` or `false`   | "profile"              |
+| `conversion.convert_parameters`       | Convert parameter slots for plugins that have a profile                  | true                   |
+| `conversion.profiles_path`            | Profiles file (relative to `apf.py`, or absolute)                        | plugin_profiles.json   |
+
+### Creating a plugin profile
+1. In Live, make a new set containing just the plugin's **VST3**. Use the device's *Configure* button and add
+   the parameters your projects use by touching each knob. Save the set.
+2. Run `python learn_profile.py sample.als --out plugin_profiles.json` (add `--plugin NAME` if the set holds
+   several VST3s). It records each parameter's id and real-unit range, whether `ControllerState` is used, and,
+   when the state is sectioned text, where each value lives (see the notes it prints for anything ambiguous;
+   knobs left at a value that other settings share cannot be located, so set them to unusual values).
+3. APF assumes a parameter's id is the same in the VST2 and the VST3. Check that for your plugin.
+4. Convert a **copy** of a project, listen, then set `"verified": true` in the profile.
+
+`plugin_profiles.json` is in `.gitignore`: it is local plugin knowledge, kept out of the repository.
+
 ## Limitations
 Some plugins may have different parameter layouts across versions, so presets might not transfer over.
 

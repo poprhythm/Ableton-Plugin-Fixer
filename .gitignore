@@ -1,0 +1,5 @@
+
+# local plugin knowledge: keep out of the general repo
+plugin_profiles.json
+__pycache__/
+apf.log

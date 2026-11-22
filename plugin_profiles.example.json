@@ -1,0 +1,27 @@
+{
+  "_readme": [
+    "Example only. APF does not read this file; copy it to plugin_profiles.json (or generate one with learn_profile.py).",
+    "match: lowercase substrings looked for in the VST2 and VST3 plugin names.",
+    "fill_controller_state: copy the preset state into ControllerState (do this if Live's own VST3 save has both filled).",
+    "state_format 'cm-sections': the state is text ('#cm=Section' then 'Key=Value' lines) from which real parameter values are read.",
+    "parameters: keyed by parameter id (assumed identical in the VST2 and VST3). min/max: the VST3 real-unit range;",
+    "  section/key: where the value lives in the state text (optional; without them the 0-1 value is rescaled linearly);",
+    "  stepped: round to a whole number.",
+    "blank_unmapped: configured slots whose id is not listed become blank slots instead of staying clamped at their minimum.",
+    "verified: false prints a warning whenever the profile is used."
+  ],
+  "profiles": [
+    {
+      "name": "ExamplePlugin",
+      "match": ["exampleplugin"],
+      "verified": false,
+      "fill_controller_state": false,
+      "state_format": "cm-sections",
+      "blank_unmapped": false,
+      "parameters": {
+        "1": { "name": "Cutoff", "min": 20, "max": 20000, "section": "Filter", "key": "Cutoff" },
+        "2": { "name": "Steps", "min": 0, "max": 3, "section": "Clock", "key": "Steps", "stepped": true }
+      }
+    }
+  ]
+}
